@@ -16,10 +16,12 @@
  *   2. Scalar ReLU vs SIMD ReLU
  *   3. Scalar Sigmoid vs SIMD Sigmoid（含 exp 多项式近似）
  *   4. HardSwish 分段函数的 SIMD blend 实现
- *   5. MatMul 的 SIMD 向量化（一次计算 8 个输出元素）
- *   6. 完整卷积管线：im2col + SIMD_GEMM
- *   7. Element-wise 加法/乘法的 SIMD + 编译器自动向量化讨论
- *   8. 总结：SIMD 编程三板斧
+ *   5. ReLU6 / SiLU / HardSigmoid 的 SIMD 实现
+ *   6. 6 种激活函数的统一调度器（Activation Dispatcher）
+ *   7. MatMul 的 SIMD 向量化（一次计算 8 个输出元素）
+ *   8. 完整卷积管线：im2col + SIMD_GEMM
+ *   9. Element-wise 加法/乘法的 SIMD + 编译器自动向量化讨论
+ *   10. 总结：SIMD 编程三板斧
  */
 
 #include <iostream>
@@ -184,7 +186,8 @@ static void SimdReLU(const float* in, float* out, uint64_t n) {
 //   4. exp(x) = exp(f) * 2^i
 //   5. sigmoid(x) = 1 / (1 + exp(-x))
 //
-// 注意：对于 |x| > 10，sigmoid 已经饱和（~0 或 ~1），直接 clamp
+// 注意：生产代码使用 fmath 库的 exp_ps256() — 查表法 + 多项式，精度更高
+// 这里用 6 项 Taylor 级数教学演示原理。
 // =====================================================================
 static void ScalarSigmoid(const float* in, float* out, uint64_t n) {
   for (uint64_t i = 0; i < n; i++)
@@ -300,7 +303,220 @@ static void SimdHardSwish(const float* in, float* out, uint64_t n) {
 }
 
 // =====================================================================
-// Part 5: MatMul — SIMD 向量化
+// Part 5: ReLU6 — SIMD 钳位到 [0, 6]
+//
+// ReLU6(x) = min(max(0, x), 6)
+// 用于 MobileNet 等移动端模型，限制激活值范围防止数值溢出。
+// SIMD: _mm256_min_ps(six, _mm256_max_ps(zero, x))
+//
+// 对应生产代码: simd.cpp → Relu6SSE()
+// =====================================================================
+static void ScalarReLU6(const float* in, float* out, uint64_t n) {
+  for (uint64_t i = 0; i < n; i++)
+    out[i] = std::min(6.0f, std::max(0.0f, in[i]));
+}
+
+static void SimdReLU6(const float* in, float* out, uint64_t n) {
+  __m256 zero = _mm256_setzero_ps();
+  __m256 six  = _mm256_set1_ps(6.0f);
+  uint64_t i = 0;
+  for (; i + 8 <= n; i += 8) {
+    __m256 v = _mm256_loadu_ps(in + i);
+    _mm256_storeu_ps(out + i, _mm256_min_ps(six, _mm256_max_ps(zero, v)));
+  }
+  for (; i < n; i++)
+    out[i] = std::min(6.0f, std::max(0.0f, in[i]));
+}
+
+// =====================================================================
+// Part 6: SiLU (Swish) — SIMD 实现
+//
+// SiLU(x) = x / (1 + exp(-x)) = x * sigmoid(x)
+// 比 ReLU 更平滑的激活函数，用于 Transformer 和高效 CNN。
+// SIMD: 复用 SIMD exp 近似计算 sigmoid，再乘以 x
+//
+// 对应生产代码: simd.cpp → SiluSSE()
+// =====================================================================
+static void ScalarSiLU(const float* in, float* out, uint64_t n) {
+  for (uint64_t i = 0; i < n; i++) {
+    float x = in[i];
+    if (x > 10.0f) out[i] = x;             // saturated: sigmoid ~ 1
+    else if (x < -5.0f) out[i] = 0.0f;     // saturated: sigmoid ~ 0
+    else out[i] = x / (1.0f + std::exp(-x));
+  }
+}
+
+static void SimdSiLU(const float* in, float* out, uint64_t n) {
+  __m256 one      = _mm256_set1_ps(1.0f);
+  __m256 zero     = _mm256_setzero_ps();
+  __m256 ln2      = _mm256_set1_ps(0.69314718056f);
+  __m256 inv_ln2  = _mm256_set1_ps(1.44269504089f);
+  __m256 p1 = _mm256_set1_ps(1.0f);
+  __m256 p2 = _mm256_set1_ps(0.5f);
+  __m256 p3 = _mm256_set1_ps(0.16666667f);
+  __m256 p4 = _mm256_set1_ps(0.04166667f);
+  __m256 p5 = _mm256_set1_ps(0.00833333f);
+  __m256 ten   = _mm256_set1_ps(10.0f);
+  __m256 mfive = _mm256_set1_ps(-5.0f);
+
+  uint64_t i = 0;
+  for (; i + 8 <= n; i += 8) {
+    __m256 x = _mm256_loadu_ps(in + i);
+    __m256 neg_x = _mm256_sub_ps(zero, x);
+
+    // exp(-x) via Taylor (same as sigmoid)
+    __m256 ir = _mm256_round_ps(_mm256_mul_ps(neg_x, inv_ln2),
+                                 _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+    __m256 fr = _mm256_sub_ps(neg_x, _mm256_mul_ps(ir, ln2));
+    __m256 expf = _mm256_add_ps(one,
+        _mm256_mul_ps(fr, _mm256_add_ps(p1,
+            _mm256_mul_ps(fr, _mm256_add_ps(p2,
+                _mm256_mul_ps(fr, _mm256_add_ps(p3,
+                    _mm256_mul_ps(fr, _mm256_add_ps(p4,
+                        _mm256_mul_ps(fr, p5))))))))));
+    __m256 two_pow_i = _mm256_castsi256_ps(
+        _mm256_slli_epi32(
+            _mm256_add_epi32(_mm256_cvttps_epi32(ir), _mm256_set1_epi32(127)),
+            23));
+    __m256 exp_neg_x = _mm256_mul_ps(expf, two_pow_i);
+
+    // sigmoid(x) = 1 / (1 + exp(-x))
+    __m256 sig = _mm256_div_ps(one, _mm256_add_ps(one, exp_neg_x));
+
+    // silu = x * sigmoid(x)
+    __m256 silu = _mm256_mul_ps(x, sig);
+
+    // Clamp: x > 10 -> x,  x < -5 -> 0, else silu
+   // _mm256_blendv_ps selects from b where mask bit=0, from a where mask bit=1
+   // cmp_ps returns 0xFFFFFFFF (all 1s) for true, 0x00000000 for false
+   // (with _CMP_*_OS flags)
+   __m256 gt_mask = _mm256_cmp_ps(x, ten, _CMP_GT_OS);   // true where x > 10
+   __m256 lt_mask = _mm256_cmp_ps(x, mfive, _CMP_LT_OS); // true where x < -5
+
+   // Step 1: blend silu with x where x > 10
+   // gt_mask=1 -> x, gt_mask=0 -> silu
+   __m256 result = _mm256_blendv_ps(silu, x, gt_mask);
+
+   // Step 2: where x < -5, replace with 0
+   // lt_mask=1 -> 0, lt_mask=0 -> result
+   __m256 zero_v = _mm256_setzero_ps();
+   result = _mm256_blendv_ps(result, zero_v, lt_mask);
+
+   _mm256_storeu_ps(out + i, result);
+  }
+  for (; i < n; i++) {
+    float x = in[i];
+    float fx = (x > 10) ? x : (x < -5) ? 0 : x / (1 + std::exp(-x));
+    out[i] = fx;
+  }
+}
+
+// =====================================================================
+// Part 7: HardSigmoid — SIMD 条件选择（Blend）
+//
+// hard_sigmoid(x) = 0             if x <= -3
+//                 = 1             if x >= 3
+//                 = x/6 + 0.5     if -3 < x < 3
+//
+// 用于 SE-Net 注意力机制（通道缩放因子）。
+// SIMD: 与 HardSwish 相同的三路 blend 策略。
+//
+// 对应生产代码: simd.cpp → HardSigmoidSSE()
+// =====================================================================
+static void ScalarHardSigmoid(const float* in, float* out, uint64_t n) {
+  for (uint64_t i = 0; i < n; i++) {
+    float x = in[i];
+    if (x <= -3.0f) out[i] = 0.0f;
+    else if (x >= 3.0f) out[i] = 1.0f;
+    else out[i] = x / 6.0f + 0.5f;
+  }
+}
+
+static void SimdHardSigmoid(const float* in, float* out, uint64_t n) {
+  __m256 zero   = _mm256_set1_ps(0.0f);
+  __m256 one    = _mm256_set1_ps(1.0f);
+  __m256 three  = _mm256_set1_ps(3.0f);
+  __m256 mthree = _mm256_set1_ps(-3.0f);
+  __m256 six    = _mm256_set1_ps(6.0f);
+  __m256 half   = _mm256_set1_ps(0.5f);
+
+  uint64_t i = 0;
+  for (; i + 8 <= n; i += 8) {
+    __m256 x = _mm256_loadu_ps(in + i);
+
+    // 三路 mask
+    __m256 le_mask = _mm256_cmp_ps(x, mthree, _CMP_LE_OS);   // x <= -3
+    __m256 ge_mask = _mm256_cmp_ps(x, three,  _CMP_GE_OS);   // x >= 3
+    __m256 mid_mask = _mm256_and_ps(
+        _mm256_cmp_ps(x, mthree, _CMP_GT_OS),
+        _mm256_cmp_ps(x, three,  _CMP_LT_OS));               // -3 < x < 3
+
+    // 三个分支
+    __m256 f_low  = zero;                                    // 0
+    __m256 f_high = one;                                      // 1
+    __m256 f_mid  = _mm256_add_ps(_mm256_div_ps(x, six), half);  // x/6 + 0.5
+
+    // Blend
+    __m256 result = _mm256_add_ps(
+        _mm256_and_ps(f_high, ge_mask),
+        _mm256_and_ps(f_mid, mid_mask));
+    _mm256_storeu_ps(out + i, result);
+  }
+  for (; i < n; i++) {
+    float x = in[i];
+    if (x <= -3.0f) out[i] = 0.0f;
+    else if (x >= 3.0f) out[i] = 1.0f;
+    else out[i] = x / 6.0f + 0.5f;
+  }
+}
+
+// =====================================================================
+// Part 8: SIMD 激活函数统一调度器（Activation Dispatcher）
+//
+// 模拟生产代码中的 ApplySSEActivation() — 根据激活类型选择对应的 SIMD 内核。
+// 这是实际框架中 BatchNorm 激活、卷积激活的调度方式。
+//
+// 对应生产代码: simd.cpp → ApplySSEActivation()
+// =====================================================================
+enum class ActivationType {
+  kReLU = 0,
+  kReLU6,
+  kSigmoid,
+  kHardSwish,
+  kSiLU,
+  kHardSigmoid,
+  kCount
+};
+
+static const char* ActivationName(ActivationType type) {
+  switch (type) {
+    case ActivationType::kReLU:        return "ReLU";
+    case ActivationType::kReLU6:       return "ReLU6";
+    case ActivationType::kSigmoid:     return "Sigmoid";
+    case ActivationType::kHardSwish:   return "HardSwish";
+    case ActivationType::kSiLU:        return "SiLU";
+    case ActivationType::kHardSigmoid: return "HardSigmoid";
+    case ActivationType::kCount:       return "Count";
+  }
+  return "Unknown";
+}
+
+// 统一调度：根据激活类型分发到对应的 SIMD 内核
+// 生产代码中返回的是函数指针 (ActivationFunc = void (*)(sftensor, sftensor))
+static void SimdActiv(const float* in, float* out, uint64_t n, ActivationType type) {
+  switch (type) {
+    case ActivationType::kReLU:        SimdReLU(in, out, n); break;
+    case ActivationType::kReLU6:       SimdReLU6(in, out, n); break;
+    case ActivationType::kSigmoid:     SimdSigmoid(in, out, n); break;
+    case ActivationType::kHardSwish:   SimdHardSwish(in, out, n); break;
+    case ActivationType::kSiLU:        SimdSiLU(in, out, n); break;
+    case ActivationType::kHardSigmoid: SimdHardSigmoid(in, out, n); break;
+    default: break;
+  }
+}
+
+// =====================================================================
+// Part 9: MatMul — SIMD 向量化
 //
 // SimdMatMul8: 同时计算 8 个输出元素 C[i][j..j+7]
 // 对 K 维度做标量循环，每步累加 acc += A[i][k] * B[k][j..j+7]
@@ -463,9 +679,180 @@ int main() {
   }
 
   // ═══════════════════════════════════════════════════
-  // Part 5: MatMul — SIMD 向量化
+  // Part 5: ReLU6 — Scalar vs SIMD
   // ═══════════════════════════════════════════════════
-  std::cout << "=== Part 5: MatMul SIMD 向量化 ===\n";
+  std::cout << "=== Part 5: ReLU6 Scalar vs SIMD ===\n";
+  {
+    constexpr uint64_t N = 1000000;
+    std::vector<float> in(N), out_s(N), out_simd(N);
+    std::mt19937 rng(42);
+    std::normal_distribution<float> dist(-2, 4);
+    for (auto& v : in) v = dist(rng);
+
+    ScalarReLU6(in.data(), out_s.data(), N);
+    SimdReLU6(in.data(), out_simd.data(), N);
+    float diff = MaxDiff(out_s.data(), out_simd.data(), N);
+    std::cout << "  Size: " << N << "  Max diff: " << std::setprecision(10) << diff
+              << "  " << (diff < 1e-5f ? "✓ exact match" : "✗") << "\n";
+
+    auto t_s = Benchmark([&]{ ScalarReLU6(in.data(), out_s.data(), N); }, 200);
+    auto t_i = Benchmark([&]{ SimdReLU6(in.data(), out_simd.data(), N); }, 200);
+    std::cout << "  Scalar: " << std::fixed << std::setprecision(3) << t_s
+              << " ms  |  SIMD: " << std::setprecision(3) << t_i
+              << " ms  |  Speedup: " << std::setprecision(2) << (t_s / t_i) << "x\n";
+    std::cout << "  (MobileNet 使用 ReLU6 限制激活范围)\n\n";
+  }
+
+  // ═══════════════════════════════════════════════════
+  // Part 6: SiLU — Scalar vs SIMD
+  // ═══════════════════════════════════════════════════
+  std::cout << "=== Part 6: SiLU (Swish) Scalar vs SIMD ===\n";
+  {
+    constexpr uint64_t N = 500000;
+    std::vector<float> in(N), out_s(N), out_simd(N);
+    std::mt19937 rng(42);
+    std::normal_distribution<float> dist(-2, 3);
+    for (auto& v : in) v = dist(rng);
+
+    ScalarSiLU(in.data(), out_s.data(), N);
+    SimdSiLU(in.data(), out_simd.data(), N);
+    float diff = MaxDiff(out_s.data(), out_simd.data(), N);
+    std::cout << "  Size: " << N << "  Max diff: " << std::setprecision(6) << diff << "\n";
+    std::cout << "  Match (tol 5e-3): " << (diff < 5e-3f ? "YES ✓" : "NO ✗") << "\n";
+
+    std::cout << "  Sample values:\n";
+    for (int idx : {0, 100, 500, 5000}) {
+      std::cout << "    x=" << std::setw(8) << std::fixed << std::setprecision(3) << in[idx]
+                << " | scalar=" << std::setw(10) << std::setprecision(6) << out_s[idx]
+                << " | simd=" << std::setw(10) << std::setprecision(6) << out_simd[idx] << "\n";
+    }
+
+    auto t_s = Benchmark([&]{ ScalarSiLU(in.data(), out_s.data(), N); }, 50);
+    auto t_i = Benchmark([&]{ SimdSiLU(in.data(), out_simd.data(), N); }, 50);
+    std::cout << "  Scalar: " << std::fixed << std::setprecision(3) << t_s
+              << " ms  |  SIMD: " << std::setprecision(3) << t_i
+              << " ms  |  Speedup: " << std::setprecision(2) << (t_s / t_i) << "x\n";
+    std::cout << "  (SiLU = x * sigmoid(x)，复用了 SIMD exp 近似)\n\n";
+  }
+
+  // ═══════════════════════════════════════════════════
+  // Part 7: HardSigmoid — Scalar vs SIMD
+  // ═══════════════════════════════════════════════════
+  std::cout << "=== Part 7: HardSigmoid Scalar vs SIMD ===\n";
+  {
+    std::vector<float> in;
+    for (int i = -100; i <= 100; i++) in.push_back(i * 0.1f);
+    uint64_t N = in.size();
+    std::vector<float> out_s(N), out_simd(N);
+
+    ScalarHardSigmoid(in.data(), out_s.data(), N);
+    SimdHardSigmoid(in.data(), out_simd.data(), N);
+
+    float diff = MaxDiff(out_s.data(), out_simd.data(), N);
+    std::cout << "  Size: " << N << " (覆盖 -10..10)  Max diff: "
+              << std::setprecision(10) << diff << "\n";
+    std::cout << "  Match: " << (diff < 1e-5f ? "YES ✓" : "NO ✗") << "\n";
+
+    std::cout << "  Boundary checks:\n";
+    auto check = [&](float x) {
+      float fs = (x <= -3) ? 0 : (x >= 3) ? 1 : x/6 + 0.5f;
+      int idx = static_cast<int>((x + 10.0f) / 0.1f);
+      std::cout << "    x=" << std::setw(6) << std::fixed << std::setprecision(1) << x
+                << " -> scalar=" << std::setw(10) << std::setprecision(4) << fs
+                << "  simd=" << std::setw(10) << std::setprecision(4) << out_simd[idx] << "\n";
+    };
+    check(-3.0f); check(-2.9f); check(0.0f); check(2.9f); check(3.0f); check(5.0f);
+
+    {
+      constexpr uint64_t BN = 2000000;
+      std::vector<float> bin(BN), bout_s(BN), bout_simd(BN);
+      std::mt19937 rng(42);
+      std::normal_distribution<float> dist(0, 3);
+      for (auto& v : bin) v = dist(rng);
+
+      auto t_s = Benchmark([&]{ ScalarHardSigmoid(bin.data(), bout_s.data(), BN); }, 200);
+      auto t_i = Benchmark([&]{ SimdHardSigmoid(bin.data(), bout_simd.data(), BN); }, 200);
+      std::cout << "\n  Performance (N=" << BN << "):\n";
+      std::cout << "    Scalar: " << std::fixed << std::setprecision(3) << t_s
+                << " ms  |  SIMD: " << std::setprecision(3) << t_i
+                << " ms  |  Speedup: " << std::setprecision(2) << (t_s / t_i) << "x\n";
+      std::cout << "  (SE-Net 注意力机制使用 HardSigmoid)\n";
+    }
+    std::cout << "\n";
+  }
+
+  // ═══════════════════════════════════════════════════
+  // Part 8: 所有 6 种激活函数的统一调度器 + 性能对比
+  // ═══════════════════════════════════════════════════
+  std::cout << "=== Part 8: 6 种激活函数 SIMD 统一调度与性能对比 ===\n";
+  {
+    constexpr uint64_t N = 2000000;
+    std::vector<float> in(N), out_s(N), out_simd(N);
+    std::mt19937 rng(42);
+    std::normal_distribution<float> dist(-3, 3);
+    for (auto& v : in) v = dist(rng);
+
+    // 每种激活函数的标量实现
+    auto scalar_relu  = [&]{ for (uint64_t i = 0; i < N; i++) out_s[i] = std::max(0.0f, in[i]); };
+    auto scalar_relu6 = [&]{ for (uint64_t i = 0; i < N; i++) out_s[i] = std::min(6.0f, std::max(0.0f, in[i])); };
+    auto scalar_sig = [&]{ for (uint64_t i = 0; i < N; i++) out_s[i] = 1.0f / (1.0f + std::exp(-in[i])); };
+    auto scalar_hswish = [&]{
+      for (uint64_t i = 0; i < N; i++) {
+        float x = in[i];
+        out_s[i] = (x <= -3) ? 0 : (x >= 3) ? x : x*(x+3)/6;
+      }
+    };
+    auto scalar_silu = [&]{
+      for (uint64_t i = 0; i < N; i++) {
+        float x = in[i];
+        if (x > 10) out_s[i] = x;
+        else if (x < -5) out_s[i] = 0;
+        else out_s[i] = x / (1 + std::exp(-x));
+      }
+    };
+    auto scalar_hsig = [&]{
+      for (uint64_t i = 0; i < N; i++) {
+        float x = in[i];
+        out_s[i] = (x <= -3) ? 0 : (x >= 3) ? 1 : x/6 + 0.5f;
+      }
+    };
+
+    std::cout << "  Benchmark (N=" << N << ", iterations=200):\n";
+    std::cout << "  " << std::left << std::setw(14) << "Activation"
+              << std::setw(12) << "Scalar(ms)" << std::setw(12) << "SIMD(ms)"
+              << std::setw(10) << "Speedup\n";
+    std::cout << "  " << std::string(48, '-') << "\n";
+
+    auto bench = [&](const char* name, auto&& scalar_fn, ActivationType type) {
+      scalar_fn();
+      SimdActiv(in.data(), out_simd.data(), N, type);
+      auto ts = Benchmark(scalar_fn, 200);
+      auto ti = Benchmark([&]{ SimdActiv(in.data(), out_simd.data(), N, type); }, 200);
+      std::cout << "  " << std::left << std::setw(14) << name
+                << std::right << std::fixed << std::setprecision(3)
+                << std::setw(11) << ts << " ms"
+                << std::setw(11) << ti << " ms"
+                << std::setw(8) << (ts / ti) << "x\n";
+    };
+
+    bench("ReLU",       scalar_relu,  ActivationType::kReLU);
+    bench("ReLU6",      scalar_relu6, ActivationType::kReLU6);
+    bench("Sigmoid",    scalar_sig,   ActivationType::kSigmoid);
+    bench("HardSwish",  scalar_hswish,ActivationType::kHardSwish);
+    bench("SiLU",       scalar_silu,  ActivationType::kSiLU);
+    bench("HardSigmoid",scalar_hsig,  ActivationType::kHardSigmoid);
+
+    std::cout << "\n  总结:\n";
+    std::cout << "    - ReLU/ReLU6: 编译器可能自动向量化，SIMD 加速不明显\n";
+    std::cout << "    - Sigmoid/SiLU: SIMD exp 近似带来最大加速 (5-10x)\n";
+    std::cout << "    - HardSwish/HardSigmoid: blend 消除分支预测，中等加速\n";
+    std::cout << "    - SimdActiv() 统一调度器模拟生产代码的激活函数分发\n\n";
+  }
+
+  // ═══════════════════════════════════════════════════
+  // Part 9: MatMul — SIMD 向量化
+  // ═══════════════════════════════════════════════════
+  std::cout << "=== Part 9: MatMul SIMD 向量化 ===\n";
   {
     struct Case { uint32_t M, K, N; std::string name; };
     std::vector<Case> cases = {
@@ -503,9 +890,9 @@ int main() {
   }
 
   // ═══════════════════════════════════════════════════
-  // Part 6: 完整卷积管线 — im2col + SIMD GEMM
+  // Part 10: 完整卷积管线 — im2col + SIMD GEMM
   // ═══════════════════════════════════════════════════
-  std::cout << "=== Part 6: Conv Pipeline — im2col + SIMD GEMM ===\n";
+  std::cout << "=== Part 10: Conv Pipeline — im2col + SIMD GEMM ===\n";
   {
     auto input = std::make_shared<Tensor<float>>(64, 28, 28);
     input->randn(0, 0.5f);
@@ -576,9 +963,9 @@ int main() {
   }
 
   // ═══════════════════════════════════════════════════
-  // Part 7: 编译器自动向量化 vs 手写 SIMD
+  // Part 11: 编译器自动向量化 vs 手写 SIMD
   // ═══════════════════════════════════════════════════
-  std::cout << "=== Part 7: 编译器自动向量化讨论 ===\n";
+  std::cout << "=== Part 11: 编译器自动向量化讨论 ===\n";
   {
     constexpr uint64_t N = 5000000;
     std::vector<float> a(N), b(N), out_s(N), out_simd(N);
@@ -639,9 +1026,9 @@ int main() {
   }
 
   // ═══════════════════════════════════════════════════
-  // Part 8: 总结
+  // Part 12: 总结
   // ═══════════════════════════════════════════════════
-  std::cout << "=== Part 8: SIMD 编程模式总结 ===\n\n";
+  std::cout << "=== Part 12: SIMD 编程模式总结 ===\n\n";
   std::cout << "  +------------------------------------------------------------------+\n";
   std::cout << "  |              SIMD 编程三板斧                                      |\n";
   std::cout << "  +------------------------------------------------------------------+\n";
@@ -677,9 +1064,16 @@ int main() {
   std::cout << "       用多项式近似替代库函数，精度 ~1e-4，速度 5-10x\n";
   std::cout << "    2.  条件分支（if-else）-> blend mask，消除分支预测失败\n";
   std::cout << "    3.  GEMM / MatMul 内层循环向量化，8x 并行累加\n\n";
-  std::cout << "  生产框架中的实践:\n";
-  std::cout << "    source/layer/details/simd.cpp 实现了 6 种 SIMD 激活函数\n";
-  std::cout << "    使用 fmath 库的 exp_ps256() — 工业级多项式近似，精度 ~1e-4\n";
+  std::cout << "  6 种激活函数与生产代码对应关系:\n";
+  std::cout << "    ReLU        -> simd.cpp::ReluSSE()\n";
+  std::cout << "    ReLU6       -> simd.cpp::Relu6SSE()\n";
+  std::cout << "    Sigmoid     -> simd.cpp::SigmoidSSE()  (使用 fmath::exp_ps256)\n";
+  std::cout << "    HardSwish   -> simd.cpp::HardSwishSSE()\n";
+  std::cout << "    SiLU        -> simd.cpp::SiluSSE()     (使用 fmath::exp_ps256)\n";
+  std::cout << "    HardSigmoid -> simd.cpp::HardSigmoidSSE()\n\n";
+  std::cout << "  生产框架调度:\n";
+  std::cout << "    simd.cpp::ApplySSEActivation() 返回函数指针\n";
+  std::cout << "    ActivationLayer::Forward() 调用对应的 SIMD 函数\n";
   std::cout << "    编译标志: -march=native 启用 CPU 最高指令集\n\n";
 
   std::cout << "All Day 17 demos completed successfully!\n";
